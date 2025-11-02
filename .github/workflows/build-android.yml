@@ -11,7 +11,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
+    env:
+      YARN_ENABLE: 0
+      EXPO_NO_YARN: 1
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,41 +32,21 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Expo
-        uses: expo/expo-github-action@v8
-        with:
-          expo-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-          # Token is optional for this workflow
+      - name: Setup Expo CLI
+        run: npm install -g @expo/cli
 
       - name: Install dependencies
-        run: |
-          npm ci
-          npm list --depth=0
+        run: npm ci
 
       - name: Run Expo Prebuild
-        run: |
-          npx expo prebuild --platform android --clean --no-install
-        env:
-          EXPO_NO_YARN: 1
-          NPM_CONFIG_FUND: false
-          NPM_CONFIG_AUDIT: false
+        run: npx expo prebuild --platform android --npm
 
-      - name: Setup Gradle Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+      - name: Make Gradlew executable
+        run: chmod +x android/gradlew
 
       - name: Build Android APK
-        run: |
-          cd android
-          chmod +x ./gradlew
-          ./gradlew assembleRelease --no-daemon
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
