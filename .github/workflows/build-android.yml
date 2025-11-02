@@ -36,19 +36,25 @@ jobs:
           # Token is optional for this workflow
 
       - name: Install dependencies
-        run: npm install
+        run: |
+          npm ci
+          npm list --depth=0
 
       - name: Run Expo Prebuild
-        run: expo prebuild --platform android --clean
+        run: |
+          npx expo prebuild --platform android --clean --no-install
+        env:
+          EXPO_NO_YARN: 1
+          NPM_CONFIG_FUND: false
+          NPM_CONFIG_AUDIT: false
 
-      - name: Cache Gradle
+      - name: Setup Gradle Cache
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-            android/.gradle
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
