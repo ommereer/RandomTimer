@@ -23,15 +23,34 @@
       "permissions": [
         "FOREGROUND_SERVICE",
         "WAKE_LOCK",
-        "VIBRATE"
+        "VIBRATE",
+        "POST_NOTIFICATIONS",
+        "RECEIVE_BOOT_COMPLETED",
+        "SCHEDULE_EXACT_ALARM"
       ],
       "package": "com.randombeep.app"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.randombeep.app",
+      "infoPlist": {
+        "UIBackgroundModes": ["audio", "fetch"],
+        "NSMicrophoneUsageDescription": false
+      }
     },
     "plugins": [
       [
         "expo-av",
         {
           "microphonePermission": false
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#10b981",
+          "sounds": ["./assets/beep.mp3"]
         }
       ]
     ]
