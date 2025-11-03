@@ -8,10 +8,9 @@ import {
   StatusBar,
   ScrollView,
   Alert,
-  Switch,
+  AppState,
 } from 'react-native';
 import { Audio } from 'expo-av';
-import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as Notifications from 'expo-notifications';
 import DateTimePicker from '@react-native-community/datetimepicker';
 
@@ -44,6 +43,8 @@ export default function App() {
   const soundRef = useRef(null);
   const notificationListener = useRef();
   const responseListener = useRef();
+  const appState = useRef(AppState.currentState);
+  const nextBeepTimeRef = useRef(0);
 
   useEffect(() => {
     setupAudio();
@@ -60,6 +61,18 @@ export default function App() {
       // Handle notification tap if needed
     });
 
+    // Monitor app state for efficient countdown updates
+    const subscription = AppState.addEventListener('change', nextAppState => {
+      appState.current = nextAppState;
+
+      // Only update countdown when app is in foreground
+      if (nextAppState === 'active' && isActive) {
+        startCountdownUpdates();
+      } else {
+        stopCountdownUpdates();
+      }
+    });
+
     return () => {
       if (soundRef.current) {
         soundRef.current.unloadAsync();
@@ -70,6 +83,7 @@ export default function App() {
       if (responseListener.current) {
         Notifications.removeNotificationSubscription(responseListener.current);
       }
+      subscription.remove();
     };
   }, []);
 
@@ -79,10 +93,10 @@ export default function App() {
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
         staysActiveInBackground: true,
-        shouldDuckAndroid: false, // Set to false to play over other audio
+        shouldDuckAndroid: true, // Duck (lower volume) other audio instead of pausing
         playThroughEarpieceAndroid: false,
-        interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DO_NOT_MIX, // Don't mix with other audio
-        interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DO_NOT_MIX, // Don't mix with other audio
+        interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DUCK_OTHERS, // Duck other audio
+        interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DUCK_OTHERS, // Duck other audio
       });
     } catch (error) {
       console.log('Error setting audio mode:', error);
@@ -124,18 +138,19 @@ export default function App() {
     }
 
     try {
-      // Use a high-pitched beep sound
+      // Use a short beep sound - keep volume moderate to not be too intrusive
       const { sound } = await Audio.Sound.createAsync(
         { uri: 'https://www.soundjay.com/buttons/sounds/beep-07.mp3' },
         {
           shouldPlay: true,
-          volume: 1.0,
+          volume: 0.7, // Moderate volume
           isLooping: false,
         }
       );
 
       soundRef.current = sound;
 
+      // Auto cleanup after sound plays
       setTimeout(() => {
         sound.unloadAsync();
       }, 500);
@@ -146,25 +161,51 @@ export default function App() {
     }
   };
 
+  const startCountdownUpdates = () => {
+    // Clear any existing interval
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+    }
+
+    // Only update countdown when app is visible (energy efficient)
+    if (appState.current === 'active' && nextBeepTimeRef.current > 0) {
+      intervalRef.current = setInterval(() => {
+        const remaining = Math.max(0, Math.round((nextBeepTimeRef.current - Date.now()) / 1000));
+        setNextBeepIn(remaining);
+
+        if (remaining === 0) {
+          clearInterval(intervalRef.current);
+        }
+      }, 1000);
+    }
+  };
+
+  const stopCountdownUpdates = () => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  };
+
   const scheduleNextBeep = () => {
     if (!isActive) return;
 
     const interval = getRandomInterval();
-    const nextBeepTime = Date.now() + interval;
+    nextBeepTimeRef.current = Date.now() + interval;
 
-    // Clear existing timers
+    // Clear existing timer
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
     }
 
-    // Schedule the beep
+    // Schedule the beep - this continues in background
     timeoutRef.current = setTimeout(async () => {
       // Check if we're within the time window before beeping
       if (isWithinTimeWindow()) {
         // Send notification (which triggers the sound)
         await Notifications.scheduleNotificationAsync({
           content: {
-            title: 'Random Beep',
+            title: 'Random Ping',
             body: '',
             sound: true,
             priority: Notifications.AndroidNotificationPriority.MAX,
@@ -174,48 +215,33 @@ export default function App() {
         });
       }
 
-      // Schedule next beep
+      // Automatically schedule next beep (continues in background)
       scheduleNextBeep();
     }, interval);
 
-    // Update countdown display
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
+    // Start countdown updates only if app is in foreground
+    if (appState.current === 'active') {
+      startCountdownUpdates();
     }
-
-    intervalRef.current = setInterval(() => {
-      const remaining = Math.max(0, Math.round((nextBeepTime - Date.now()) / 1000));
-      setNextBeepIn(remaining);
-
-      if (remaining === 0) {
-        clearInterval(intervalRef.current);
-      }
-    }, 1000);
   };
 
   useEffect(() => {
     if (isActive) {
       scheduleNextBeep();
-      activateKeepAwakeAsync();
     } else {
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
       }
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      deactivateKeepAwake();
+      stopCountdownUpdates();
       setNextBeepIn(0);
+      nextBeepTimeRef.current = 0;
     }
 
     return () => {
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
       }
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      deactivateKeepAwake();
+      stopCountdownUpdates();
     };
   }, [isActive, avgBeepsPerHour]);
 
@@ -413,15 +439,16 @@ export default function App() {
           <Text style={styles.infoTitle}>How it works</Text>
           <Text style={styles.infoText}>
             • Pings sound at random intervals{'\n'}
-            • Works in background and over other apps{'\n'}
+            • Plays over other apps without stopping them{'\n'}
             • Only active during your set time window{'\n'}
-            • Keep the app running for best results
+            • Energy efficient background operation{'\n'}
+            • Automatically continues when backgrounded
           </Text>
         </View>
 
         <Text style={styles.footerText}>
           {isActive
-            ? 'App keeps device awake while running'
+            ? 'Timer running in background'
             : 'Configure settings and tap play to start'}
         </Text>
       </ScrollView>
