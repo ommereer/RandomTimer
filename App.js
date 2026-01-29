@@ -9,32 +9,61 @@ import {
   ScrollView,
   Alert,
   AppState,
+  Switch,
+  Modal,
 } from 'react-native';
 import { Audio } from 'expo-av';
 import * as Notifications from 'expo-notifications';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import * as TaskManager from 'expo-task-manager';
 
-// Configure notification handler - play sound when notification fires
+const BACKGROUND_NOTIFICATION_TASK = 'BACKGROUND-NOTIFICATION-TASK';
+
+// Configure notification handler
 Notifications.setNotificationHandler({
-  handleNotification: async (notification) => {
-    // Only show alert if app is in background
-    const isBeep = notification.request.content.data?.type === 'beep';
-
-    return {
-      shouldShowAlert: false, // Don't show notification UI
-      shouldPlaySound: true,  // Play the sound
-      shouldSetBadge: false,
-    };
-  },
+  handleNotification: async () => ({
+    shouldShowAlert: false,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+    priority: Notifications.AndroidNotificationPriority.MAX,
+  }),
 });
+
+// Define the background task
+TaskManager.defineTask(BACKGROUND_NOTIFICATION_TASK, async ({ data, error }) => {
+  if (error) {
+    console.error(error);
+    return;
+  }
+  if (data) {
+    // Task will handle notification scheduling
+  }
+});
+
+// Frequency presets: pings per hour
+const FREQUENCY_PRESETS = [
+  { value: 0.125, label: '1 ping / 8 hours' },
+  { value: 0.25, label: '1 ping / 4 hours' },
+  { value: 0.5, label: '1 ping / 2 hours' },
+  { value: 1, label: '1 ping / hour' },
+  { value: 2, label: '2 pings / hour' },
+  { value: 4, label: '4 pings / hour' },
+  { value: 6, label: '6 pings / hour' },
+  { value: 12, label: '12 pings / hour' },
+  { value: 20, label: '20 pings / hour' },
+  { value: 30, label: '30 pings / hour' },
+  { value: 60, label: '60 pings / hour' },
+];
 
 export default function App() {
   const [isActive, setIsActive] = useState(false);
   const [avgBeepsPerHour, setAvgBeepsPerHour] = useState(12);
   const [nextBeepIn, setNextBeepIn] = useState(0);
   const [totalBeeps, setTotalBeeps] = useState(0);
+  const [showHelp, setShowHelp] = useState(false);
 
   // Time window settings
+  const [useTimeWindow, setUseTimeWindow] = useState(true);
   const [startHour, setStartHour] = useState(9);
   const [startMinute, setStartMinute] = useState(0);
   const [endHour, setEndHour] = useState(21);
@@ -45,35 +74,24 @@ export default function App() {
   const intervalRef = useRef(null);
   const soundRef = useRef(null);
   const notificationListener = useRef();
-  const responseListener = useRef();
   const appState = useRef(AppState.currentState);
   const nextBeepTimeRef = useRef(0);
   const notificationIdRef = useRef(null);
+  const foregroundServiceStarted = useRef(false);
 
   useEffect(() => {
     setupAudio();
     requestPermissions();
 
-    // Listen for when notifications fire - schedule the next one
     notificationListener.current = Notifications.addNotificationReceivedListener(async (notification) => {
       if (notification.request.content.data?.type === 'beep') {
-        // Play sound directly
         playBeepSound();
-
-        // Schedule next beep
         scheduleNextBeep();
       }
     });
 
-    responseListener.current = Notifications.addNotificationResponseReceivedListener(response => {
-      // Handle notification tap if needed
-    });
-
-    // Monitor app state for efficient countdown updates
     const subscription = AppState.addEventListener('change', nextAppState => {
       appState.current = nextAppState;
-
-      // Only update countdown when app is in foreground and timer is running
       if (nextAppState === 'active' && nextBeepTimeRef.current > 0) {
         startCountdownUpdates();
       } else {
@@ -88,9 +106,6 @@ export default function App() {
       if (notificationListener.current) {
         Notifications.removeNotificationSubscription(notificationListener.current);
       }
-      if (responseListener.current) {
-        Notifications.removeNotificationSubscription(responseListener.current);
-      }
       subscription.remove();
     };
   }, []);
@@ -101,10 +116,10 @@ export default function App() {
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
         staysActiveInBackground: true,
-        shouldDuckAndroid: true, // Duck (lower volume) other audio instead of pausing
+        shouldDuckAndroid: true,
         playThroughEarpieceAndroid: false,
-        interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DUCK_OTHERS, // Duck other audio
-        interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DUCK_OTHERS, // Duck other audio
+        interruptionModeIOS: Audio.INTERRUPTION_MODE_IOS_DUCK_OTHERS,
+        interruptionModeAndroid: Audio.INTERRUPTION_MODE_ANDROID_DUCK_OTHERS,
       });
     } catch (error) {
       console.log('Error setting audio mode:', error);
@@ -114,21 +129,53 @@ export default function App() {
   const requestPermissions = async () => {
     const { status } = await Notifications.requestPermissionsAsync();
     if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Notification permission is required for the app to work in the background.');
+      Alert.alert('Permission needed', 'Notification permission is required for background operation.');
+    }
+  };
+
+  const startForegroundService = async () => {
+    if (foregroundServiceStarted.current) return;
+
+    try {
+      // Create persistent notification for foreground service
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Random Timer Active',
+          body: '',
+          data: { type: 'foreground' },
+          sticky: true,
+          priority: Notifications.AndroidNotificationPriority.LOW,
+        },
+        trigger: null,
+      });
+      foregroundServiceStarted.current = true;
+    } catch (error) {
+      console.log('Error starting foreground service:', error);
+    }
+  };
+
+  const stopForegroundService = async () => {
+    if (!foregroundServiceStarted.current) return;
+
+    try {
+      await Notifications.dismissAllNotificationsAsync();
+      foregroundServiceStarted.current = false;
+    } catch (error) {
+      console.log('Error stopping foreground service:', error);
     }
   };
 
   const isWithinTimeWindow = () => {
+    if (!useTimeWindow) return true;
+
     const now = new Date();
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
     const startMinutes = startHour * 60 + startMinute;
     const endMinutes = endHour * 60 + endMinute;
 
     if (startMinutes <= endMinutes) {
-      // Normal case: e.g., 9:00 AM to 9:00 PM
       return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
     } else {
-      // Overnight case: e.g., 11:00 PM to 2:00 AM
       return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
     }
   };
@@ -142,19 +189,12 @@ export default function App() {
 
   const playBeepSound = async () => {
     try {
-      // Play local beep sound file
       const { sound } = await Audio.Sound.createAsync(
         require('./assets/beep.mp3'),
-        {
-          shouldPlay: true,
-          volume: 0.9, // High volume for audibility
-          isLooping: false,
-        }
+        { shouldPlay: true, volume: 0.9, isLooping: false }
       );
 
       soundRef.current = sound;
-
-      // Auto cleanup after sound plays
       sound.setOnPlaybackStatusUpdate((status) => {
         if (status.didJustFinish) {
           sound.unloadAsync();
@@ -168,20 +208,13 @@ export default function App() {
   };
 
   const startCountdownUpdates = () => {
-    // Clear any existing interval
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-    }
+    if (intervalRef.current) clearInterval(intervalRef.current);
 
-    // Only update countdown when app is visible (energy efficient)
     if (appState.current === 'active' && nextBeepTimeRef.current > 0) {
       intervalRef.current = setInterval(() => {
         const remaining = Math.max(0, Math.round((nextBeepTimeRef.current - Date.now()) / 1000));
         setNextBeepIn(remaining);
-
-        if (remaining === 0) {
-          clearInterval(intervalRef.current);
-        }
+        if (remaining === 0) clearInterval(intervalRef.current);
       }, 1000);
     }
   };
@@ -197,7 +230,6 @@ export default function App() {
     if (!isActive) return;
 
     try {
-      // Cancel previous scheduled notification if exists
       if (notificationIdRef.current) {
         await Notifications.cancelScheduledNotificationAsync(notificationIdRef.current);
       }
@@ -206,63 +238,51 @@ export default function App() {
       const intervalSeconds = Math.floor(intervalMs / 1000);
       nextBeepTimeRef.current = Date.now() + intervalMs;
 
-      // Check if we're within time window
       if (!isWithinTimeWindow()) {
-        // If outside window, schedule next check in 1 minute
-        const checkInterval = 60; // 60 seconds
+        const checkInterval = 60;
         nextBeepTimeRef.current = Date.now() + (checkInterval * 1000);
 
         notificationIdRef.current = await Notifications.scheduleNotificationAsync({
           content: {
-            title: 'Random Ping',
+            title: '',
             body: '',
-            sound: 'beep.mp3', // Reference to sound file
+            sound: 'beep.mp3',
             data: { type: 'beep' },
           },
-          trigger: {
-            seconds: checkInterval,
-          },
+          trigger: { seconds: checkInterval },
         });
 
-        if (appState.current === 'active') {
-          startCountdownUpdates();
-        }
+        if (appState.current === 'active') startCountdownUpdates();
         return;
       }
 
-      // Schedule notification with time-based trigger
       notificationIdRef.current = await Notifications.scheduleNotificationAsync({
         content: {
-          title: 'Random Ping',
+          title: '',
           body: '',
-          sound: 'beep.mp3', // Reference to sound file
+          sound: 'beep.mp3',
           data: { type: 'beep' },
         },
-        trigger: {
-          seconds: intervalSeconds,
-        },
+        trigger: { seconds: intervalSeconds },
       });
 
-      // Start countdown updates only if app is in foreground
-      if (appState.current === 'active') {
-        startCountdownUpdates();
-      }
+      if (appState.current === 'active') startCountdownUpdates();
     } catch (error) {
       console.log('Error scheduling notification:', error);
-      // Try again in 5 seconds
       setTimeout(() => scheduleNextBeep(), 5000);
     }
   };
 
   useEffect(() => {
     if (isActive) {
+      startForegroundService();
       scheduleNextBeep();
     } else {
-      // Cancel all scheduled notifications
       if (notificationIdRef.current) {
         Notifications.cancelScheduledNotificationAsync(notificationIdRef.current);
         notificationIdRef.current = null;
       }
+      stopForegroundService();
       stopCountdownUpdates();
       setNextBeepIn(0);
       nextBeepTimeRef.current = 0;
@@ -281,8 +301,12 @@ export default function App() {
   };
 
   const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
+    const hours = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
     const secs = seconds % 60;
+    if (hours > 0) {
+      return `${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
@@ -292,144 +316,128 @@ export default function App() {
     return `${displayHour}:${minute.toString().padStart(2, '0')} ${period}`;
   };
 
-  const testBeep = () => {
-    playBeepSound();
+  const getIntervalDescription = (beepsPerHour) => {
+    const preset = FREQUENCY_PRESETS.find(p => p.value === beepsPerHour);
+    if (preset) return preset.label;
+    const hours = 1 / beepsPerHour;
+    if (hours >= 1) {
+      return `1 ping / ${Math.round(hours)} hours`;
+    }
+    const mins = 60 / beepsPerHour;
+    return `1 ping / ${Math.round(mins)} min`;
   };
 
-  const onStartTimeChange = (event, selectedDate) => {
-    setShowStartPicker(Platform.OS === 'ios');
-    if (selectedDate) {
-      setStartHour(selectedDate.getHours());
-      setStartMinute(selectedDate.getMinutes());
-    }
+  const selectNextFrequency = () => {
+    if (isActive) return;
+    const currentIndex = FREQUENCY_PRESETS.findIndex(p => p.value === avgBeepsPerHour);
+    const nextIndex = (currentIndex + 1) % FREQUENCY_PRESETS.length;
+    setAvgBeepsPerHour(FREQUENCY_PRESETS[nextIndex].value);
   };
 
-  const onEndTimeChange = (event, selectedDate) => {
-    setShowEndPicker(Platform.OS === 'ios');
-    if (selectedDate) {
-      setEndHour(selectedDate.getHours());
-      setEndMinute(selectedDate.getMinutes());
-    }
-  };
-
-  const incrementBeepsPerHour = () => {
-    if (avgBeepsPerHour < 60 && !isActive) {
-      setAvgBeepsPerHour(avgBeepsPerHour + 1);
-    }
-  };
-
-  const decrementBeepsPerHour = () => {
-    if (avgBeepsPerHour > 1 && !isActive) {
-      setAvgBeepsPerHour(avgBeepsPerHour - 1);
-    }
+  const selectPrevFrequency = () => {
+    if (isActive) return;
+    const currentIndex = FREQUENCY_PRESETS.findIndex(p => p.value === avgBeepsPerHour);
+    const prevIndex = currentIndex === 0 ? FREQUENCY_PRESETS.length - 1 : currentIndex - 1;
+    setAvgBeepsPerHour(FREQUENCY_PRESETS[prevIndex].value);
   };
 
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
-      <ScrollView
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator={false}
-      >
+
+      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <Text style={styles.title}>Random Ping Timer</Text>
-          <Text style={styles.subtitle}>Stay mindful with random reminders</Text>
+          <TouchableOpacity onPress={() => setShowHelp(true)} style={styles.helpButton}>
+            <Text style={styles.helpButtonText}>?</Text>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.powerSection}>
           <TouchableOpacity
-            style={[
-              styles.powerButton,
-              isActive ? styles.powerButtonActive : styles.powerButtonInactive
-            ]}
+            style={[styles.powerButton, isActive ? styles.powerButtonActive : styles.powerButtonInactive]}
             onPress={toggleActive}
             activeOpacity={0.8}
           >
             <Text style={styles.powerIcon}>{isActive ? '⏸' : '▶'}</Text>
           </TouchableOpacity>
 
-          <Text style={styles.statusText}>
-            {isActive ? 'Active' : 'Inactive'}
-          </Text>
+          <Text style={styles.statusText}>{isActive ? 'Active' : 'Inactive'}</Text>
 
           {isActive && (
             <View style={styles.countdownSection}>
               <Text style={styles.countdownLabel}>Next ping in:</Text>
               <Text style={styles.countdownTime}>{formatTime(nextBeepIn)}</Text>
-              <Text style={styles.beepCount}>Total pings: {totalBeeps}</Text>
-              {!isWithinTimeWindow() && (
-                <Text style={styles.outsideWindowText}>
-                  Outside active time window
-                </Text>
-              )}
+              <Text style={styles.beepCount}>Total: {totalBeeps}</Text>
             </View>
           )}
         </View>
 
         <View style={styles.settingsCard}>
-          <Text style={styles.sectionTitle}>Settings</Text>
-
-          {/* Beeps per hour */}
           <View style={styles.settingItem}>
-            <View style={styles.settingHeader}>
-              <Text style={styles.settingLabel}>Pings per Hour</Text>
-              <View style={styles.counterContainer}>
-                <TouchableOpacity
-                  style={[styles.counterButton, isActive && styles.counterButtonDisabled]}
-                  onPress={decrementBeepsPerHour}
-                  disabled={isActive}
-                >
-                  <Text style={styles.counterButtonText}>−</Text>
-                </TouchableOpacity>
-                <Text style={styles.settingValue}>{avgBeepsPerHour}</Text>
-                <TouchableOpacity
-                  style={[styles.counterButton, isActive && styles.counterButtonDisabled]}
-                  onPress={incrementBeepsPerHour}
-                  disabled={isActive}
-                >
-                  <Text style={styles.counterButtonText}>+</Text>
-                </TouchableOpacity>
-              </View>
+            <Text style={styles.settingLabel}>Frequency</Text>
+            <View style={styles.frequencySelector}>
+              <TouchableOpacity
+                style={[styles.freqButton, isActive && styles.freqButtonDisabled]}
+                onPress={selectPrevFrequency}
+                disabled={isActive}
+              >
+                <Text style={styles.freqButtonText}>◀</Text>
+              </TouchableOpacity>
+              <Text style={styles.frequencyText}>{getIntervalDescription(avgBeepsPerHour)}</Text>
+              <TouchableOpacity
+                style={[styles.freqButton, isActive && styles.freqButtonDisabled]}
+                onPress={selectNextFrequency}
+                disabled={isActive}
+              >
+                <Text style={styles.freqButtonText}>▶</Text>
+              </TouchableOpacity>
             </View>
-            <Text style={styles.settingDescription}>
-              Average: 1 ping every {Math.round(60 / avgBeepsPerHour)} minutes
-            </Text>
           </View>
 
-          {/* Time window */}
           <View style={styles.divider} />
 
           <View style={styles.settingItem}>
-            <Text style={styles.settingLabel}>Active Time Window</Text>
-            <Text style={styles.settingDescription}>Pings will only sound during this time</Text>
-
-            <View style={styles.timeWindowContainer}>
-              <View style={styles.timePickerRow}>
-                <Text style={styles.timeLabel}>Start:</Text>
-                <TouchableOpacity
-                  style={styles.timeButton}
-                  onPress={() => setShowStartPicker(true)}
-                  disabled={isActive}
-                >
-                  <Text style={styles.timeButtonText}>
-                    {formatTimeDisplay(startHour, startMinute)}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.timePickerRow}>
-                <Text style={styles.timeLabel}>End:</Text>
-                <TouchableOpacity
-                  style={styles.timeButton}
-                  onPress={() => setShowEndPicker(true)}
-                  disabled={isActive}
-                >
-                  <Text style={styles.timeButtonText}>
-                    {formatTimeDisplay(endHour, endMinute)}
-                  </Text>
-                </TouchableOpacity>
-              </View>
+            <View style={styles.settingHeader}>
+              <Text style={styles.settingLabel}>Time Window</Text>
+              <Switch
+                value={useTimeWindow}
+                onValueChange={setUseTimeWindow}
+                disabled={isActive}
+                trackColor={{ false: '#475569', true: '#10b981' }}
+                thumbColor={useTimeWindow ? '#ffffff' : '#cbd5e1'}
+              />
             </View>
+
+            {useTimeWindow && (
+              <View style={styles.timeWindowContainer}>
+                <View style={styles.timePickerRow}>
+                  <Text style={styles.timeLabel}>Start:</Text>
+                  <TouchableOpacity
+                    style={styles.timeButton}
+                    onPress={() => setShowStartPicker(true)}
+                    disabled={isActive}
+                  >
+                    <Text style={styles.timeButtonText}>
+                      {formatTimeDisplay(startHour, startMinute)}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.timePickerRow}>
+                  <Text style={styles.timeLabel}>End:</Text>
+                  <TouchableOpacity
+                    style={styles.timeButton}
+                    onPress={() => setShowEndPicker(true)}
+                    disabled={isActive}
+                  >
+                    <Text style={styles.timeButtonText}>
+                      {formatTimeDisplay(endHour, endMinute)}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
           </View>
 
           {showStartPicker && (
@@ -438,7 +446,13 @@ export default function App() {
               mode="time"
               is24Hour={false}
               display="default"
-              onChange={onStartTimeChange}
+              onChange={(event, selectedDate) => {
+                setShowStartPicker(Platform.OS === 'ios');
+                if (selectedDate) {
+                  setStartHour(selectedDate.getHours());
+                  setStartMinute(selectedDate.getMinutes());
+                }
+              }}
             />
           )}
 
@@ -448,38 +462,53 @@ export default function App() {
               mode="time"
               is24Hour={false}
               display="default"
-              onChange={onEndTimeChange}
+              onChange={(event, selectedDate) => {
+                setShowEndPicker(Platform.OS === 'ios');
+                if (selectedDate) {
+                  setEndHour(selectedDate.getHours());
+                  setEndMinute(selectedDate.getMinutes());
+                }
+              }}
             />
           )}
 
           <View style={styles.divider} />
 
-          <TouchableOpacity
-            style={styles.testButton}
-            onPress={testBeep}
-            activeOpacity={0.8}
-          >
+          <TouchableOpacity style={styles.testButton} onPress={() => playBeepSound()} activeOpacity={0.8}>
             <Text style={styles.testButtonText}>Test Ping</Text>
           </TouchableOpacity>
         </View>
-
-        <View style={styles.infoCard}>
-          <Text style={styles.infoTitle}>How it works</Text>
-          <Text style={styles.infoText}>
-            • Pings sound at random intervals{'\n'}
-            • Plays over other apps without stopping them{'\n'}
-            • Only active during your set time window{'\n'}
-            • Works in background and when screen is locked{'\n'}
-            • Automatically continues indefinitely
-          </Text>
-        </View>
-
-        <Text style={styles.footerText}>
-          {isActive
-            ? 'Timer running in background'
-            : 'Configure settings and tap play to start'}
-        </Text>
       </ScrollView>
+
+      {/* Help Modal */}
+      <Modal visible={showHelp} transparent animationType="fade" onRequestClose={() => setShowHelp(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>How It Works</Text>
+
+            <Text style={styles.helpText}>
+              <Text style={styles.helpBold}>Random Pings</Text>{'\n'}
+              Pings sound at random intervals around your chosen frequency.{'\n\n'}
+
+              <Text style={styles.helpBold}>Frequency</Text>{'\n'}
+              Choose how often pings occur (from once per 8 hours to 60 times per hour).{'\n\n'}
+
+              <Text style={styles.helpBold}>Time Window</Text>{'\n'}
+              Enable to restrict pings to certain hours. Disable for 24/7 operation.{'\n\n'}
+
+              <Text style={styles.helpBold}>Background Operation</Text>{'\n'}
+              Works in background and when screen is locked. Plays over other audio without pausing it.{'\n\n'}
+
+              <Text style={styles.helpBold}>Battery</Text>{'\n'}
+              Uses foreground service for reliable operation with minimal battery impact.
+            </Text>
+
+            <TouchableOpacity style={styles.modalButton} onPress={() => setShowHelp(false)}>
+              <Text style={styles.modalButtonText}>Got it</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -494,27 +523,39 @@ const styles = StyleSheet.create({
     paddingTop: Platform.OS === 'android' ? 40 : 60,
   },
   header: {
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     marginBottom: 20,
   },
   title: {
-    fontSize: 28,
+    fontSize: 24,
     fontWeight: 'bold',
     color: '#ffffff',
-    marginBottom: 8,
   },
-  subtitle: {
-    fontSize: 14,
-    color: '#94a3b8',
+  helpButton: {
+    position: 'absolute',
+    right: 0,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#334155',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  helpButtonText: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#10b981',
   },
   powerSection: {
     alignItems: 'center',
     paddingVertical: 30,
   },
   powerButton: {
-    width: 140,
-    height: 140,
-    borderRadius: 70,
+    width: 120,
+    height: 120,
+    borderRadius: 60,
     justifyContent: 'center',
     alignItems: 'center',
     elevation: 8,
@@ -530,55 +571,43 @@ const styles = StyleSheet.create({
     backgroundColor: '#475569',
   },
   powerIcon: {
-    fontSize: 50,
+    fontSize: 40,
     color: '#ffffff',
   },
   statusText: {
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: '600',
     color: '#ffffff',
-    marginTop: 16,
+    marginTop: 12,
   },
   countdownSection: {
     alignItems: 'center',
-    marginTop: 20,
+    marginTop: 16,
   },
   countdownLabel: {
-    fontSize: 14,
+    fontSize: 12,
     color: '#cbd5e1',
-    marginBottom: 8,
+    marginBottom: 4,
   },
   countdownTime: {
-    fontSize: 36,
+    fontSize: 32,
     fontWeight: 'bold',
     color: '#10b981',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   beepCount: {
-    fontSize: 12,
+    fontSize: 11,
     color: '#94a3b8',
-    marginTop: 8,
-  },
-  outsideWindowText: {
-    fontSize: 12,
-    color: '#f59e0b',
-    marginTop: 8,
-    fontStyle: 'italic',
+    marginTop: 6,
   },
   settingsCard: {
     backgroundColor: '#1e293b',
     borderRadius: 16,
     padding: 20,
-    marginBottom: 16,
-  },
-  sectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#ffffff',
-    marginBottom: 16,
+    marginBottom: 20,
   },
   settingItem: {
-    marginBottom: 16,
+    marginBottom: 8,
   },
   settingHeader: {
     flexDirection: 'row',
@@ -587,43 +616,38 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   settingLabel: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '500',
     color: '#ffffff',
-    marginBottom: 4,
+    marginBottom: 8,
   },
-  settingValue: {
-    fontSize: 20,
-    fontWeight: '600',
-    color: '#10b981',
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
-    marginHorizontal: 20,
-  },
-  settingDescription: {
-    fontSize: 13,
-    color: '#94a3b8',
-    marginTop: 4,
-  },
-  counterContainer: {
+  frequencySelector: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
   },
-  counterButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+  freqButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: '#10b981',
     justifyContent: 'center',
     alignItems: 'center',
   },
-  counterButtonDisabled: {
+  freqButtonDisabled: {
     backgroundColor: '#475569',
     opacity: 0.5,
   },
-  counterButtonText: {
-    fontSize: 24,
+  freqButtonText: {
+    fontSize: 16,
     color: '#ffffff',
     fontWeight: 'bold',
+  },
+  frequencyText: {
+    fontSize: 16,
+    color: '#10b981',
+    fontWeight: '600',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   divider: {
     height: 1,
@@ -631,69 +655,86 @@ const styles = StyleSheet.create({
     marginVertical: 16,
   },
   timeWindowContainer: {
-    marginTop: 12,
+    marginTop: 8,
   },
   timePickerRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 12,
+    marginBottom: 10,
   },
   timeLabel: {
-    fontSize: 15,
+    fontSize: 14,
     color: '#cbd5e1',
     fontWeight: '500',
   },
   timeButton: {
     backgroundColor: '#334155',
-    paddingVertical: 10,
-    paddingHorizontal: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
     borderRadius: 8,
-    minWidth: 120,
+    minWidth: 100,
     alignItems: 'center',
   },
   timeButtonText: {
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '600',
     color: '#10b981',
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   testButton: {
     backgroundColor: '#2563eb',
-    paddingVertical: 14,
-    borderRadius: 12,
+    paddingVertical: 12,
+    borderRadius: 10,
     alignItems: 'center',
-    marginTop: 8,
   },
   testButtonText: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '600',
     color: '#ffffff',
   },
-  infoCard: {
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContent: {
     backgroundColor: '#1e293b',
     borderRadius: 16,
-    padding: 20,
-    marginBottom: 16,
-    borderLeftWidth: 4,
-    borderLeftColor: '#10b981',
+    padding: 24,
+    width: '100%',
+    maxWidth: 400,
+    borderWidth: 1,
+    borderColor: '#334155',
   },
-  infoTitle: {
-    fontSize: 16,
-    fontWeight: '600',
+  modalTitle: {
+    fontSize: 22,
+    fontWeight: 'bold',
     color: '#ffffff',
-    marginBottom: 12,
+    marginBottom: 16,
+    textAlign: 'center',
   },
-  infoText: {
+  helpText: {
     fontSize: 14,
     color: '#cbd5e1',
     lineHeight: 22,
-  },
-  footerText: {
-    textAlign: 'center',
-    fontSize: 12,
-    color: '#64748b',
-    marginTop: 8,
     marginBottom: 20,
+  },
+  helpBold: {
+    fontWeight: '700',
+    color: '#10b981',
+  },
+  modalButton: {
+    backgroundColor: '#10b981',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  modalButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#ffffff',
   },
 });
