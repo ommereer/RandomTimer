@@ -138,9 +138,9 @@ export default function App() {
     }
 
     try {
-      // Use a short beep sound - keep volume moderate to not be too intrusive
+      // Use local beep sound file
       const { sound } = await Audio.Sound.createAsync(
-        { uri: 'https://www.soundjay.com/buttons/sounds/beep-07.mp3' },
+        require('./assets/beep.mp3'),
         {
           shouldPlay: true,
           volume: 0.7, // Moderate volume
@@ -158,6 +158,7 @@ export default function App() {
       setTotalBeeps(prev => prev + 1);
     } catch (error) {
       console.log('Error playing sound:', error);
+      // Don't let sound error break the app
     }
   };
 
@@ -200,22 +201,27 @@ export default function App() {
 
     // Schedule the beep - this continues in background
     timeoutRef.current = setTimeout(async () => {
-      // Check if we're within the time window before beeping
-      if (isWithinTimeWindow()) {
-        // Send notification (which triggers the sound)
-        await Notifications.scheduleNotificationAsync({
-          content: {
-            title: 'Random Ping',
-            body: '',
-            sound: true,
-            priority: Notifications.AndroidNotificationPriority.MAX,
-            data: { type: 'beep' },
-          },
-          trigger: null, // null means immediate
-        });
+      // Try to play beep, but always schedule next regardless of success
+      try {
+        // Check if we're within the time window before beeping
+        if (isWithinTimeWindow()) {
+          // Send notification (which triggers the sound)
+          await Notifications.scheduleNotificationAsync({
+            content: {
+              title: 'Random Ping',
+              body: '',
+              sound: true,
+              priority: Notifications.AndroidNotificationPriority.MAX,
+              data: { type: 'beep' },
+            },
+            trigger: null, // null means immediate
+          });
+        }
+      } catch (error) {
+        console.log('Error scheduling notification:', error);
       }
 
-      // Automatically schedule next beep (continues in background)
+      // ALWAYS schedule next beep (even if current beep failed)
       scheduleNextBeep();
     }, interval);
 
