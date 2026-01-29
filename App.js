@@ -14,14 +14,18 @@ import { Audio } from 'expo-av';
 import * as Notifications from 'expo-notifications';
 import DateTimePicker from '@react-native-community/datetimepicker';
 
-// Configure notification handler
+// Configure notification handler - play sound when notification fires
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: false,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-    priority: Notifications.AndroidNotificationPriority.MAX,
-  }),
+  handleNotification: async (notification) => {
+    // Only show alert if app is in background
+    const isBeep = notification.request.content.data?.type === 'beep';
+
+    return {
+      shouldShowAlert: false, // Don't show notification UI
+      shouldPlaySound: true,  // Play the sound
+      shouldSetBadge: false,
+    };
+  },
 });
 
 export default function App() {
@@ -38,22 +42,26 @@ export default function App() {
   const [showStartPicker, setShowStartPicker] = useState(false);
   const [showEndPicker, setShowEndPicker] = useState(false);
 
-  const timeoutRef = useRef(null);
   const intervalRef = useRef(null);
   const soundRef = useRef(null);
   const notificationListener = useRef();
   const responseListener = useRef();
   const appState = useRef(AppState.currentState);
   const nextBeepTimeRef = useRef(0);
+  const notificationIdRef = useRef(null);
 
   useEffect(() => {
     setupAudio();
     requestPermissions();
 
-    // Listen for notifications (triggers sound playback)
-    notificationListener.current = Notifications.addNotificationReceivedListener(notification => {
-      if (notification.request.content.data.type === 'beep') {
-        playBeep();
+    // Listen for when notifications fire - schedule the next one
+    notificationListener.current = Notifications.addNotificationReceivedListener(async (notification) => {
+      if (notification.request.content.data?.type === 'beep') {
+        // Play sound directly
+        playBeepSound();
+
+        // Schedule next beep
+        scheduleNextBeep();
       }
     });
 
@@ -132,18 +140,14 @@ export default function App() {
     return Math.random() * (maxInterval - minInterval) + minInterval;
   };
 
-  const playBeep = async () => {
-    if (!isWithinTimeWindow()) {
-      return;
-    }
-
+  const playBeepSound = async () => {
     try {
-      // Use local beep sound file
+      // Play local beep sound file
       const { sound } = await Audio.Sound.createAsync(
         require('./assets/beep.mp3'),
         {
           shouldPlay: true,
-          volume: 0.7, // Moderate volume
+          volume: 0.9, // High volume for audibility
           isLooping: false,
         }
       );
@@ -151,14 +155,15 @@ export default function App() {
       soundRef.current = sound;
 
       // Auto cleanup after sound plays
-      setTimeout(() => {
-        sound.unloadAsync();
-      }, 500);
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.didJustFinish) {
+          sound.unloadAsync();
+        }
+      });
 
       setTotalBeeps(prev => prev + 1);
     } catch (error) {
       console.log('Error playing sound:', error);
-      // Don't let sound error break the app
     }
   };
 
@@ -188,46 +193,64 @@ export default function App() {
     }
   };
 
-  const scheduleNextBeep = () => {
+  const scheduleNextBeep = async () => {
     if (!isActive) return;
 
-    const interval = getRandomInterval();
-    nextBeepTimeRef.current = Date.now() + interval;
-
-    // Clear existing timer
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-
-    // Schedule the beep - this continues in background
-    timeoutRef.current = setTimeout(async () => {
-      // Try to play beep, but always schedule next regardless of success
-      try {
-        // Check if we're within the time window before beeping
-        if (isWithinTimeWindow()) {
-          // Send notification (which triggers the sound)
-          await Notifications.scheduleNotificationAsync({
-            content: {
-              title: 'Random Ping',
-              body: '',
-              sound: true,
-              priority: Notifications.AndroidNotificationPriority.MAX,
-              data: { type: 'beep' },
-            },
-            trigger: null, // null means immediate
-          });
-        }
-      } catch (error) {
-        console.log('Error scheduling notification:', error);
+    try {
+      // Cancel previous scheduled notification if exists
+      if (notificationIdRef.current) {
+        await Notifications.cancelScheduledNotificationAsync(notificationIdRef.current);
       }
 
-      // ALWAYS schedule next beep (even if current beep failed)
-      scheduleNextBeep();
-    }, interval);
+      const intervalMs = getRandomInterval();
+      const intervalSeconds = Math.floor(intervalMs / 1000);
+      nextBeepTimeRef.current = Date.now() + intervalMs;
 
-    // Start countdown updates only if app is in foreground
-    if (appState.current === 'active') {
-      startCountdownUpdates();
+      // Check if we're within time window
+      if (!isWithinTimeWindow()) {
+        // If outside window, schedule next check in 1 minute
+        const checkInterval = 60; // 60 seconds
+        nextBeepTimeRef.current = Date.now() + (checkInterval * 1000);
+
+        notificationIdRef.current = await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Random Ping',
+            body: '',
+            sound: 'beep.mp3', // Reference to sound file
+            data: { type: 'beep' },
+          },
+          trigger: {
+            seconds: checkInterval,
+          },
+        });
+
+        if (appState.current === 'active') {
+          startCountdownUpdates();
+        }
+        return;
+      }
+
+      // Schedule notification with time-based trigger
+      notificationIdRef.current = await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Random Ping',
+          body: '',
+          sound: 'beep.mp3', // Reference to sound file
+          data: { type: 'beep' },
+        },
+        trigger: {
+          seconds: intervalSeconds,
+        },
+      });
+
+      // Start countdown updates only if app is in foreground
+      if (appState.current === 'active') {
+        startCountdownUpdates();
+      }
+    } catch (error) {
+      console.log('Error scheduling notification:', error);
+      // Try again in 5 seconds
+      setTimeout(() => scheduleNextBeep(), 5000);
     }
   };
 
@@ -235,8 +258,10 @@ export default function App() {
     if (isActive) {
       scheduleNextBeep();
     } else {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
+      // Cancel all scheduled notifications
+      if (notificationIdRef.current) {
+        Notifications.cancelScheduledNotificationAsync(notificationIdRef.current);
+        notificationIdRef.current = null;
       }
       stopCountdownUpdates();
       setNextBeepIn(0);
@@ -244,9 +269,6 @@ export default function App() {
     }
 
     return () => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
       stopCountdownUpdates();
     };
   }, [isActive, avgBeepsPerHour]);
@@ -271,7 +293,7 @@ export default function App() {
   };
 
   const testBeep = () => {
-    playBeep();
+    playBeepSound();
   };
 
   const onStartTimeChange = (event, selectedDate) => {
@@ -447,8 +469,8 @@ export default function App() {
             • Pings sound at random intervals{'\n'}
             • Plays over other apps without stopping them{'\n'}
             • Only active during your set time window{'\n'}
-            • Energy efficient background operation{'\n'}
-            • Automatically continues when backgrounded
+            • Works in background and when screen is locked{'\n'}
+            • Automatically continues indefinitely
           </Text>
         </View>
 
