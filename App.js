@@ -65,8 +65,8 @@ export default function App() {
     const subscription = AppState.addEventListener('change', nextAppState => {
       appState.current = nextAppState;
 
-      // Only update countdown when app is in foreground
-      if (nextAppState === 'active' && isActive) {
+      // Only update countdown when app is in foreground and timer is running
+      if (nextAppState === 'active' && nextBeepTimeRef.current > 0) {
         startCountdownUpdates();
       } else {
         stopCountdownUpdates();
