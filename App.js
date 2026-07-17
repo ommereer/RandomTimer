@@ -15,29 +15,17 @@ import {
 import { Audio } from 'expo-av';
 import * as Notifications from 'expo-notifications';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import * as TaskManager from 'expo-task-manager';
 
-const BACKGROUND_NOTIFICATION_TASK = 'BACKGROUND-NOTIFICATION-TASK';
-
-// Configure notification handler
+// Foreground behavior: suppress the beep notification's own sound/banner
+// (we play it via expo-av for volume control); do show the status notification.
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: false,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-    priority: Notifications.AndroidNotificationPriority.MAX,
-  }),
-});
-
-// Define the background task
-TaskManager.defineTask(BACKGROUND_NOTIFICATION_TASK, async ({ data, error }) => {
-  if (error) {
-    console.error(error);
-    return;
-  }
-  if (data) {
-    // Task will handle notification scheduling
-  }
+  handleNotification: async (notification) => {
+    const type = notification.request.content.data?.type;
+    if (type === 'status') {
+      return { shouldShowAlert: true, shouldPlaySound: false, shouldSetBadge: false };
+    }
+    return { shouldShowAlert: false, shouldPlaySound: false, shouldSetBadge: false };
+  },
 });
 
 // Frequency presets: pings per hour
@@ -54,6 +42,10 @@ const FREQUENCY_PRESETS = [
   { value: 30, label: '30 pings / hour' },
   { value: 60, label: '60 pings / hour' },
 ];
+
+// OS limits: iOS allows 64 pending local notifications; stay under it.
+const MAX_SCHEDULED = 60;
+const SCHEDULE_HORIZON_MS = 24 * 60 * 60 * 1000;
 
 export default function App() {
   const [isActive, setIsActive] = useState(false);
@@ -76,23 +68,35 @@ export default function App() {
   const notificationListener = useRef();
   const appState = useRef(AppState.currentState);
   const nextBeepTimeRef = useRef(0);
-  const notificationIdRef = useRef(null);
-  const foregroundServiceStarted = useRef(false);
+  const statusShownRef = useRef(false);
+
+  // Live copies of state for use inside long-lived listeners.
+  // Listeners registered at mount would otherwise capture stale values.
+  const isActiveRef = useRef(isActive);
+  const settingsRef = useRef({});
+  isActiveRef.current = isActive;
+  settingsRef.current = { avgBeepsPerHour, useTimeWindow, startHour, startMinute, endHour, endMinute };
 
   useEffect(() => {
     setupAudio();
-    requestPermissions();
+    setupNotifications();
 
-    notificationListener.current = Notifications.addNotificationReceivedListener(async (notification) => {
+    // Fires when a ping arrives while the app is in the foreground:
+    // play the sound ourselves and top up the scheduled queue.
+    notificationListener.current = Notifications.addNotificationReceivedListener((notification) => {
       if (notification.request.content.data?.type === 'beep') {
         playBeepSound();
-        scheduleNextBeep();
+        scheduleAllPings();
       }
     });
 
-    const subscription = AppState.addEventListener('change', nextAppState => {
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      const wasBackground = appState.current !== 'active';
       appState.current = nextAppState;
-      if (nextAppState === 'active' && nextBeepTimeRef.current > 0) {
+      if (nextAppState === 'active' && isActiveRef.current) {
+        // Returning to foreground: refresh the queue (pings may have fired
+        // while we were away) and resume the countdown display.
+        if (wasBackground) scheduleAllPings();
         startCountdownUpdates();
       } else {
         stopCountdownUpdates();
@@ -100,9 +104,7 @@ export default function App() {
     });
 
     return () => {
-      if (soundRef.current) {
-        soundRef.current.unloadAsync();
-      }
+      if (soundRef.current) soundRef.current.unloadAsync();
       if (notificationListener.current) {
         Notifications.removeNotificationSubscription(notificationListener.current);
       }
@@ -126,65 +128,113 @@ export default function App() {
     }
   };
 
-  const requestPermissions = async () => {
+  const setupNotifications = async () => {
     const { status } = await Notifications.requestPermissionsAsync();
     if (status !== 'granted') {
       Alert.alert('Permission needed', 'Notification permission is required for background operation.');
     }
-  };
 
-  const startForegroundService = async () => {
-    if (foregroundServiceStarted.current) return;
-
-    try {
-      // Create persistent notification for foreground service
-      await Notifications.scheduleNotificationAsync({
-        content: {
-          title: 'Random Timer Active',
-          body: '',
-          data: { type: 'foreground' },
-          sticky: true,
-          priority: Notifications.AndroidNotificationPriority.LOW,
-        },
-        trigger: null,
+    // Android 8+ plays notification sounds per channel; the channel must
+    // reference the sound file bundled by the expo-notifications plugin.
+    if (Platform.OS === 'android') {
+      await Notifications.setNotificationChannelAsync('pings', {
+        name: 'Pings',
+        importance: Notifications.AndroidImportance.HIGH,
+        sound: 'beep.mp3',
+        vibrationPattern: [0],
+        enableVibrate: false,
       });
-      foregroundServiceStarted.current = true;
-    } catch (error) {
-      console.log('Error starting foreground service:', error);
+      await Notifications.setNotificationChannelAsync('status', {
+        name: 'Timer status',
+        importance: Notifications.AndroidImportance.LOW,
+      });
     }
   };
 
-  const stopForegroundService = async () => {
-    if (!foregroundServiceStarted.current) return;
-
-    try {
-      await Notifications.dismissAllNotificationsAsync();
-      foregroundServiceStarted.current = false;
-    } catch (error) {
-      console.log('Error stopping foreground service:', error);
+  const isTimeWithinWindow = (timeMs) => {
+    const s = settingsRef.current;
+    if (!s.useTimeWindow) return true;
+    const d = new Date(timeMs);
+    const cur = d.getHours() * 60 + d.getMinutes();
+    const start = s.startHour * 60 + s.startMinute;
+    const end = s.endHour * 60 + s.endMinute;
+    if (start <= end) {
+      return cur >= start && cur <= end;
     }
+    // Overnight window, e.g. 11 PM - 2 AM
+    return cur >= start || cur <= end;
   };
 
-  const isWithinTimeWindow = () => {
-    if (!useTimeWindow) return true;
-
-    const now = new Date();
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
-    const startMinutes = startHour * 60 + startMinute;
-    const endMinutes = endHour * 60 + endMinute;
-
-    if (startMinutes <= endMinutes) {
-      return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
-    } else {
-      return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
-    }
+  const nextWindowStart = (timeMs) => {
+    const s = settingsRef.current;
+    const start = new Date(timeMs);
+    start.setHours(s.startHour, s.startMinute, 0, 0);
+    if (start.getTime() <= timeMs) start.setDate(start.getDate() + 1);
+    return start.getTime();
   };
 
   const getRandomInterval = () => {
-    const avgIntervalMs = (60 * 60 * 1000) / avgBeepsPerHour;
-    const minInterval = avgIntervalMs * 0.5;
-    const maxInterval = avgIntervalMs * 1.5;
-    return Math.random() * (maxInterval - minInterval) + minInterval;
+    const avgIntervalMs = (60 * 60 * 1000) / settingsRef.current.avgBeepsPerHour;
+    return avgIntervalMs * (0.5 + Math.random());
+  };
+
+  // Pre-schedule a batch of pings with the OS. These fire (with sound)
+  // even if the app process is killed. The queue is topped up whenever a
+  // ping fires in the foreground or the app returns to the foreground.
+  const scheduleAllPings = async () => {
+    if (!isActiveRef.current) return;
+
+    try {
+      await Notifications.cancelAllScheduledNotificationsAsync();
+
+      const times = [];
+      let t = Date.now();
+      const horizon = Date.now() + SCHEDULE_HORIZON_MS;
+      while (times.length < MAX_SCHEDULED && t < horizon) {
+        t += getRandomInterval();
+        if (!isTimeWithinWindow(t)) {
+          // Jump to shortly after the window opens
+          t = nextWindowStart(t) + Math.floor(Math.random() * 30 * 60 * 1000);
+        }
+        times.push(t);
+      }
+
+      for (const time of times) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Ping',
+            sound: 'beep.mp3',
+            data: { type: 'beep' },
+          },
+          trigger: Platform.OS === 'android'
+            ? { channelId: 'pings', date: new Date(time) }
+            : { date: new Date(time) },
+        });
+      }
+
+      nextBeepTimeRef.current = times.length > 0 ? times[0] : 0;
+      if (appState.current === 'active') startCountdownUpdates();
+    } catch (error) {
+      console.log('Error scheduling pings:', error);
+    }
+  };
+
+  const showStatusNotification = async () => {
+    if (statusShownRef.current) return;
+    try {
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Random Timer Active',
+          sticky: true,
+          autoDismiss: false,
+          data: { type: 'status' },
+        },
+        trigger: Platform.OS === 'android' ? { channelId: 'status' } : null,
+      });
+      statusShownRef.current = true;
+    } catch (error) {
+      console.log('Error showing status notification:', error);
+    }
   };
 
   const playBeepSound = async () => {
@@ -196,12 +246,10 @@ export default function App() {
 
       soundRef.current = sound;
       sound.setOnPlaybackStatusUpdate((status) => {
-        if (status.didJustFinish) {
-          sound.unloadAsync();
-        }
+        if (status.didJustFinish) sound.unloadAsync();
       });
 
-      setTotalBeeps(prev => prev + 1);
+      setTotalBeeps((prev) => prev + 1);
     } catch (error) {
       console.log('Error playing sound:', error);
     }
@@ -226,72 +274,21 @@ export default function App() {
     }
   };
 
-  const scheduleNextBeep = async () => {
-    if (!isActive) return;
-
-    try {
-      if (notificationIdRef.current) {
-        await Notifications.cancelScheduledNotificationAsync(notificationIdRef.current);
-      }
-
-      const intervalMs = getRandomInterval();
-      const intervalSeconds = Math.floor(intervalMs / 1000);
-      nextBeepTimeRef.current = Date.now() + intervalMs;
-
-      if (!isWithinTimeWindow()) {
-        const checkInterval = 60;
-        nextBeepTimeRef.current = Date.now() + (checkInterval * 1000);
-
-        notificationIdRef.current = await Notifications.scheduleNotificationAsync({
-          content: {
-            title: '',
-            body: '',
-            sound: 'beep.mp3',
-            data: { type: 'beep' },
-          },
-          trigger: { seconds: checkInterval },
-        });
-
-        if (appState.current === 'active') startCountdownUpdates();
-        return;
-      }
-
-      notificationIdRef.current = await Notifications.scheduleNotificationAsync({
-        content: {
-          title: '',
-          body: '',
-          sound: 'beep.mp3',
-          data: { type: 'beep' },
-        },
-        trigger: { seconds: intervalSeconds },
-      });
-
-      if (appState.current === 'active') startCountdownUpdates();
-    } catch (error) {
-      console.log('Error scheduling notification:', error);
-      setTimeout(() => scheduleNextBeep(), 5000);
-    }
-  };
-
   useEffect(() => {
     if (isActive) {
-      startForegroundService();
-      scheduleNextBeep();
+      showStatusNotification();
+      scheduleAllPings();
     } else {
-      if (notificationIdRef.current) {
-        Notifications.cancelScheduledNotificationAsync(notificationIdRef.current);
-        notificationIdRef.current = null;
-      }
-      stopForegroundService();
+      Notifications.cancelAllScheduledNotificationsAsync();
+      Notifications.dismissAllNotificationsAsync();
+      statusShownRef.current = false;
       stopCountdownUpdates();
       setNextBeepIn(0);
       nextBeepTimeRef.current = 0;
     }
 
-    return () => {
-      stopCountdownUpdates();
-    };
-  }, [isActive, avgBeepsPerHour]);
+    return () => stopCountdownUpdates();
+  }, [isActive]);
 
   const toggleActive = () => {
     setIsActive(!isActive);
@@ -317,26 +314,20 @@ export default function App() {
   };
 
   const getIntervalDescription = (beepsPerHour) => {
-    const preset = FREQUENCY_PRESETS.find(p => p.value === beepsPerHour);
-    if (preset) return preset.label;
-    const hours = 1 / beepsPerHour;
-    if (hours >= 1) {
-      return `1 ping / ${Math.round(hours)} hours`;
-    }
-    const mins = 60 / beepsPerHour;
-    return `1 ping / ${Math.round(mins)} min`;
+    const preset = FREQUENCY_PRESETS.find((p) => p.value === beepsPerHour);
+    return preset ? preset.label : `${beepsPerHour} pings / hour`;
   };
 
   const selectNextFrequency = () => {
     if (isActive) return;
-    const currentIndex = FREQUENCY_PRESETS.findIndex(p => p.value === avgBeepsPerHour);
+    const currentIndex = FREQUENCY_PRESETS.findIndex((p) => p.value === avgBeepsPerHour);
     const nextIndex = (currentIndex + 1) % FREQUENCY_PRESETS.length;
     setAvgBeepsPerHour(FREQUENCY_PRESETS[nextIndex].value);
   };
 
   const selectPrevFrequency = () => {
     if (isActive) return;
-    const currentIndex = FREQUENCY_PRESETS.findIndex(p => p.value === avgBeepsPerHour);
+    const currentIndex = FREQUENCY_PRESETS.findIndex((p) => p.value === avgBeepsPerHour);
     const prevIndex = currentIndex === 0 ? FREQUENCY_PRESETS.length - 1 : currentIndex - 1;
     setAvgBeepsPerHour(FREQUENCY_PRESETS[prevIndex].value);
   };
@@ -491,16 +482,16 @@ export default function App() {
               Pings sound at random intervals around your chosen frequency.{'\n\n'}
 
               <Text style={styles.helpBold}>Frequency</Text>{'\n'}
-              Choose how often pings occur (from once per 8 hours to 60 times per hour).{'\n\n'}
+              Choose how often pings occur, from once per 8 hours to 60 times per hour.{'\n\n'}
 
               <Text style={styles.helpBold}>Time Window</Text>{'\n'}
               Enable to restrict pings to certain hours. Disable for 24/7 operation.{'\n\n'}
 
               <Text style={styles.helpBold}>Background Operation</Text>{'\n'}
-              Works in background and when screen is locked. Plays over other audio without pausing it.{'\n\n'}
+              Upcoming pings are scheduled with the system in advance, so they sound even when the screen is locked or the app is closed. Opening the app refreshes the schedule.{'\n\n'}
 
               <Text style={styles.helpBold}>Battery</Text>{'\n'}
-              Uses foreground service for reliable operation with minimal battery impact.
+              The app does no work between pings — the system fires them — so battery impact is minimal.
             </Text>
 
             <TouchableOpacity style={styles.modalButton} onPress={() => setShowHelp(false)}>
