@@ -1,31 +1,36 @@
-```json
 {
   "expo": {
     "name": "Random Beep Timer",
     "slug": "random-beep-app",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
+    "backgroundColor": "#0f172a",
     "splash": {
-      "image": "./assets/splash.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#0f172a"
+      "backgroundColor": "#0f172a",
+      "resizeMode": "contain"
     },
     "assetBundlePatterns": [
       "**/*"
     ],
     "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0f172a"
-      },
       "permissions": [
         "FOREGROUND_SERVICE",
         "WAKE_LOCK",
-        "VIBRATE"
+        "VIBRATE",
+        "POST_NOTIFICATIONS",
+        "RECEIVE_BOOT_COMPLETED",
+        "SCHEDULE_EXACT_ALARM"
       ],
       "package": "com.randombeep.app"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.randombeep.app",
+      "infoPlist": {
+        "UIBackgroundModes": ["audio", "fetch"],
+        "NSMicrophoneUsageDescription": false
+      }
     },
     "plugins": [
       [
@@ -33,8 +38,14 @@
         {
           "microphonePermission": false
         }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#10b981",
+          "sounds": ["./assets/beep.mp3"]
+        }
       ]
     ]
   }
 }
-```
